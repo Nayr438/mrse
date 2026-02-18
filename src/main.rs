@@ -31,12 +31,13 @@ mod signatures {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Version {
     Mrs1,
     Mrs2,
     Mrs3,
     Mg2,
+    Mg3,
 }
 
 fn main() {
@@ -57,39 +58,33 @@ fn main() {
                 .map(|ext| ext.eq_ignore_ascii_case("mrs")) // Check if the extension is "mrs"
                 .unwrap_or(false) // If the extension is not "mrs", return false
         })
-        .map(|entry| entry.into_path()) // Convert the entry to a path
-        .collect(); // Collect the paths into a vector
-
-    if mrs_files.is_empty() {
-        let _ = writeln!(writer.lock().unwrap(), "No .mrs files found.");
-    } else {
-        let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1); // Get the number of available threads, if for some reason this fails, use 1 thread
-
-        thread::scope(|scope| {
-            for chunk in mrs_files.chunks(mrs_files.len().div_ceil(num_threads).max(1)) {
-                let output = &output;
-                let directory = &directory;
-                let writer = &writer;
-                scope.spawn(move || { // Spawn a new thread for each chunk
-                    for path in chunk {
-                        let relative = path.strip_prefix(directory).unwrap_or(path); // Get the relative path of the file
-                        let dest = output.join(relative.with_extension(""));
-                        match extract_archive(path, &dest, writer) { // Extract the archive
-                            Ok(()) => {}
-                            Err(err) => {
-                                let _ = writeln!(
-                                    writer.lock().unwrap(),
-                                    "{}: Error: {err}",
-                                    path.display()
-                                );
-                            }
+        .map(|entry| entry.path().to_path_buf())
+        .collect();
+    
+    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    thread::scope(|scope| {
+        for chunk in mrs_files.chunks(mrs_files.len().div_ceil(num_threads).max(1)) {
+            let output = &output;
+            let directory = &directory;
+            let writer = &writer;
+            scope.spawn(move || { // Spawn a new thread for each chunk
+                for path in chunk {
+                    let relative = path.strip_prefix(directory).unwrap_or(path); // Get the relative path of the file
+                    let dest = output.join(relative.with_extension(""));
+                    match extract_archive(path, &dest, writer) { // Extract the archive
+                        Ok(()) => {}
+                        Err(err) => {
+                            let _ = writeln!(
+                                writer.lock().unwrap(),
+                                "{}: Error: {err}",
+                                path.display()
+                            );
                         }
                     }
-                });
-            }
-        });
-    }
-
+                }
+            });
+        }
+    });
 }
 
 fn extract_archive(
@@ -105,7 +100,7 @@ fn extract_archive(
     let file_sig = u32::from_le_bytes(buf); // Convert the 4 bytes to a 32-bit unsigned integer
 
     // Determine the version and seed of the archive
-    let (version, seed) = match file_sig { // Basiclly a switch statement
+    let (mut version, seed) = match file_sig { // Basiclly a switch statement
         signatures::v1::FILE => (Version::Mrs1, 0),
         signatures::v2::FILE | signatures::v2::FILE_ALT => (Version::Mrs2, 0),
         signatures::mg2::FILE => (Version::Mg2, 0),
@@ -118,19 +113,32 @@ fn extract_archive(
         }
     };
 
-    reader.seek(SeekFrom::End(-22))?;
     let mut end = vec![0u8; 22];
-    reader.read_exact(&mut end)?;
-    recover(&mut end, version, seed);
+    loop {
+        reader.seek(SeekFrom::End(-22))?;
+        reader.read_exact(&mut end)?;
+        recover(&mut end, version, seed);
 
-    let sig = u32::from_le_bytes(end[0..4].try_into().unwrap());
-    let valid = match version {
-        Version::Mrs1 => sig == signatures::v1::END_RECORD || sig == signatures::v1::END_RECORD_ALT,
-        Version::Mrs2 => sig == signatures::v2::END_RECORD || sig == signatures::v2::END_RECORD_ALT,
-        Version::Mrs3 => sig == signatures::v3::END_RECORD,
-        Version::Mg2 => sig == signatures::mg2::END_RECORD,
-    };
-    if !valid {
+        let sig = u32::from_le_bytes(end[0..4].try_into().unwrap());
+        let valid = match version {
+            Version::Mrs1 => sig == signatures::v1::END_RECORD || sig == signatures::v1::END_RECORD_ALT,
+            Version::Mrs2 => sig == signatures::v2::END_RECORD || sig == signatures::v2::END_RECORD_ALT,
+            Version::Mrs3 => sig == signatures::v3::END_RECORD,
+            Version::Mg2 => sig == signatures::mg2::END_RECORD,
+            Version::Mg3 => sig == signatures::mg2::END_RECORD,
+        };
+        
+        if valid {
+            break;
+        }
+        
+        // If Mrs2 validation failed, try with Mg3
+        // I will clean this up later, but for now it works.
+        if version == Version::Mrs2 {
+            version = Version::Mg3;
+            continue;
+        }
+        
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Invalid end record",
@@ -219,6 +227,23 @@ fn recover(buf: &mut [u8], version: Version, seed: u32) {
             ];
             for (i, byte) in buf.iter_mut().enumerate() {
                 *byte ^= KEY[i % 18];
+            }
+        }
+        Version::Mg3 => {
+            const KEY: [u8; 100] = [
+                0xCE, 0x9E, 0x4D, 0x68, 0xAE, 0x9D, 0x0E, 0x3C, 0xD1, 0x88,
+                0x91, 0x43, 0x81, 0x9C, 0x9A, 0xD3, 0xAC, 0x67, 0x0F, 0x00,
+                0xC3, 0x8C, 0x76, 0x89, 0x12, 0xF4, 0x92, 0xE9, 0x1E, 0xBA,
+                0x4B, 0x90, 0xB1, 0x9A, 0xDF, 0xC8, 0x42, 0x77, 0x2C, 0x73,
+                0xC7, 0x9C, 0xD8, 0x79, 0x7F, 0xFE, 0xD8, 0x6E, 0x3E, 0x13,
+                0x39, 0x4A, 0x5C, 0x3D, 0xCA, 0x0D, 0xDE, 0x84, 0xE9, 0x8F,
+                0x10, 0x61, 0xE7, 0xC1, 0xEA, 0x39, 0x80, 0xCA, 0x77, 0xF8,
+                0x9A, 0x38, 0xCE, 0x1F, 0xF7, 0x1B, 0xF6, 0x53, 0x20, 0xF7,
+                0xF9, 0x64, 0x9D, 0x95, 0xEB, 0x0F, 0xCD, 0x0B, 0x02, 0x81,
+                0x81, 0x80, 0x1C, 0x0E, 0xFE, 0x5C, 0xC2, 0xD4, 0x95, 0x31,
+            ];
+            for (i, byte) in buf.iter_mut().enumerate() {
+                *byte ^= KEY[i % 100];
             }
         }
     }
