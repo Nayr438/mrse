@@ -58,33 +58,38 @@ fn main() {
                 .map(|ext| ext.eq_ignore_ascii_case("mrs")) // Check if the extension is "mrs"
                 .unwrap_or(false) // If the extension is not "mrs", return false
         })
-        .map(|entry| entry.path().to_path_buf())
-        .collect();
-    
-    let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    thread::scope(|scope| {
-        for chunk in mrs_files.chunks(mrs_files.len().div_ceil(num_threads).max(1)) {
-            let output = &output;
-            let directory = &directory;
-            let writer = &writer;
-            scope.spawn(move || { // Spawn a new thread for each chunk
-                for path in chunk {
-                    let relative = path.strip_prefix(directory).unwrap_or(path); // Get the relative path of the file
-                    let dest = output.join(relative.with_extension(""));
-                    match extract_archive(path, &dest, writer) { // Extract the archive
-                        Ok(()) => {}
-                        Err(err) => {
-                            let _ = writeln!(
-                                writer.lock().unwrap(),
-                                "{}: Error: {err}",
-                                path.display()
-                            );
+        .map(|entry| entry.into_path()) // Convert the entry to a path
+        .collect(); // Collect the paths into a vector
+
+    if mrs_files.is_empty() {
+        let _ = writeln!(writer.lock().unwrap(), "No .mrs files found.");
+    } else {
+        let num_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1); // Get the number of available threads, if for some reason this fails, use 1 thread
+
+        thread::scope(|scope| {
+            for chunk in mrs_files.chunks(mrs_files.len().div_ceil(num_threads).max(1)) {
+                let output = &output;
+                let directory = &directory;
+                let writer = &writer;
+                scope.spawn(move || { // Spawn a new thread for each chunk
+                    for path in chunk {
+                        let relative = path.strip_prefix(directory).unwrap_or(path); // Get the relative path of the file
+                        let dest = output.join(relative.with_extension(""));
+                        match extract_archive(path, &dest, writer) { // Extract the archive
+                            Ok(()) => {}
+                            Err(err) => {
+                                let _ = writeln!(
+                                    writer.lock().unwrap(),
+                                    "{}: Error: {err}",
+                                    path.display()
+                                );
+                            }
                         }
                     }
-                }
-            });
-        }
-    });
+                });
+            }
+        });
+    }
 }
 
 fn extract_archive(
